@@ -1,0 +1,5 @@
+hotel-agent/          ← a folder you make anywhere (Desktop is fine)
+  ├─ app.py           ← the main code (you paste it)
+  ├─ requirements.txt ← a list of tools to install
+  ├─ .env             ← holds your secret API key
+  └─ hotels.csv       ← your data file (copy it here)
