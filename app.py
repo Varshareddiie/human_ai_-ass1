@@ -1,538 +1,413 @@
-# app.py
-from flask import Flask, render_template, request, send_file
+#!/usr/bin/env python3
+"""
+Grad Director AI Chatbot -> Hotel QA Agent (Assignment-Ready)
+
+Implements a LangGraph agent with exactly ONE custom tool that queries a hotels.csv
+dataset, and a Streamlit chat interface.
+
+Features required by the assignment:
+- Loads hotels.csv once per session and normalizes columns
+- Exactly one tool: query_hotels (structured args; filters, thresholds, sort, limit)
+- LangGraph orchestration with tool invocation
+- Natural-language answers + tabular text summary
+- Handles no-match cases with explicit guidance
+- Clamp limit to [1, 10]
+- Uses OPENAI_API_KEY from environment (.env)
+
+Run: `streamlit run app.py`
+"""
+
 import os
-import zipfile
-import pandas as pd
-import numpy as np
-
-# ML / Sampling
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-from imblearn.over_sampling import RandomOverSampler
-from imblearn.under_sampling import RandomUnderSampler
-
-# Text utils
 import re
-import string
-import unidecode
+import json
+from typing import List, Optional, TypedDict, Any, Dict
 
-# NLTK (download resources at runtime if missing)
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-from nltk.stem import PorterStemmer, WordNetLemmatizer
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
 
-# Docs / PDFs
-import PyPDF2
-import docx
+# LangChain / LangGraph
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_core.messages import AnyMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.runnables import RunnableConfig
+from langchain_core.chat_history import InMemoryChatMessageHistory
 
-# Images
-import cv2
-from PIL import Image
+# -----------------------------------------------------------------------------
+# ENV & PAGE CONFIG
+# -----------------------------------------------------------------------------
+load_dotenv()
 
+st.set_page_config(
+    page_title="Hotel QA Agent",
+    page_icon="🏨",
+    layout="centered",
+)
 
-# ---------- Flask App ----------
-app = Flask(__name__)
+# -----------------------------------------------------------------------------
+# DATA LOADING (ONCE PER SESSION)
+# -----------------------------------------------------------------------------
+REQUIRED_COLS = {
+    "hotel id": "hotel_id",
+    "hotel name": "hotel_name",
+    "city": "city",
+    "country": "country",
+    "lat": "lat",
+    "lon": "lon",
+    "star rating": "star_rating",
+    "cleanliness base": "cleanliness_base",
+    "comfort base": "comfort_base",
+    "facilities base": "facilities_base",
+}
 
-# Ensure uploads dir exists
-os.makedirs("uploads", exist_ok=True)
+NUMERIC_COLS = ["star_rating", "cleanliness_base", "comfort_base", "facilities_base", "lat", "lon"]
+TEXT_COLS = ["city", "country", "hotel_name"]  # 'hotel_id' may be numeric; keep as-is if present
 
+@st.cache_data(show_spinner=False)
+def load_and_normalize_hotels(csv_path: str) -> pd.DataFrame:
+    # Load
+    df = pd.read_csv(csv_path)
 
-# ---------- Helpers: Tabular ----------
-def handle_missing_values(data: pd.DataFrame) -> pd.DataFrame:
-    """Handle missing values in tabular data."""
-    for column in data.columns:
-        if data[column].dtype in ["int64", "float64"]:
-            # For numerical columns, fill missing values with mean/median
-            if data[column].isnull().sum() > 0:
-                # use mean for floats, median for ints
-                if data[column].dtype == "float64":
-                    data[column].fillna(data[column].mean(), inplace=True)
-                else:
-                    data[column].fillna(data[column].median(), inplace=True)
-        elif data[column].dtype == "object":
-            # For categorical columns, fill missing with mode
-            if data[column].isnull().sum() > 0:
-                data[column].fillna(data[column].mode().iloc[0], inplace=True)
-    return data
+    # Standardize columns: lowercase, strip & map to internal names
+    col_map = {}
+    for c in df.columns:
+        key = c.strip().lower()
+        if key in REQUIRED_COLS:
+            col_map[c] = REQUIRED_COLS[key]
+    df = df.rename(columns=col_map)
 
+    # Ensure all required columns exist
+    missing = [v for v in REQUIRED_COLS.values() if v not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in CSV: {missing}")
 
-def normalize_data(data: pd.DataFrame) -> pd.DataFrame:
-    """Feature scaling using MinMaxScaler for numeric columns."""
-    scaler = MinMaxScaler()
-    numeric_cols = data.select_dtypes(include=["int64", "float64"]).columns
-    if len(numeric_cols) == 0:
-        return data
-    data[numeric_cols] = scaler.fit_transform(data[numeric_cols])
-    return data
+    # Normalize text columns: strip & lowercase for consistent filtering
+    for c in TEXT_COLS:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+            # Keep original-cased display copy, but store a normalized column for matching
+            df[f"{c}__norm"] = df[c].str.lower()
 
+    # Numeric coercion
+    for c in NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-def encode_categorical(data: pd.DataFrame) -> pd.DataFrame:
-    """One-hot encode categorical columns."""
-    categorical_cols = data.select_dtypes(include=["object"]).columns
-    if len(categorical_cols) == 0:
-        return data
-    data = pd.get_dummies(data, columns=categorical_cols)
-    return data
+    # Drop rows missing key numerics to avoid weird comparisons
+    df = df.dropna(subset=["star_rating", "cleanliness_base", "comfort_base", "facilities_base"])
 
+    # Helpful display column order
+    preferred = [
+        "hotel_id", "hotel_name", "city", "country",
+        "star_rating", "cleanliness_base", "comfort_base", "facilities_base",
+        "lat", "lon"
+    ]
+    display_cols = [c for c in preferred if c in df.columns]
+    df = df[display_cols + [c for c in df.columns if c not in display_cols]]
 
-def handle_outliers(data: pd.DataFrame, method: str, outliers_method: str) -> pd.DataFrame:
-    """
-    Handle outliers using IQR or Z-score.
-    method: 'iqr' or 'z-score'
-    outliers_method: 'clip' or 'remove'
-    """
-    numeric_cols = data.select_dtypes(include="number").columns
-    clean_data = data.copy()
-
-    if len(numeric_cols) == 0:
-        return clean_data
-
-    if method == "iqr":
-        for col in numeric_cols:
-            Q1 = data[col].quantile(0.25)
-            Q3 = data[col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower = Q1 - 1.5 * IQR
-            upper = Q3 + 1.5 * IQR
-            if outliers_method == "clip":
-                clean_data[col] = clean_data[col].clip(lower=lower, upper=upper)
-            elif outliers_method == "remove":
-                clean_data = clean_data[(clean_data[col] >= lower) & (clean_data[col] <= upper)]
-            else:
-                raise ValueError("Invalid outliers_method. Use 'clip' or 'remove'.")
-    elif method == "z-score":
-        for col in numeric_cols:
-            mu = data[col].mean()
-            sigma = data[col].std(ddof=0) if data[col].std(ddof=0) != 0 else 1.0
-            z = (data[col] - mu) / sigma
-            if outliers_method == "clip":
-                # clip to +/-3 std then convert back to original scale
-                clipped_z = z.clip(-3, 3)
-                clean_data[col] = clipped_z * sigma + mu
-            elif outliers_method == "remove":
-                clean_data = clean_data[(z >= -3) & (z <= 3)]
-            else:
-                raise ValueError("Invalid outliers_method. Use 'clip' or 'remove'.")
-    else:
-        raise ValueError("Invalid method. Use 'iqr' or 'z-score'.")
-
-    return clean_data
-
-
-def handle_imbalanced_data(data: pd.DataFrame, target_column_name: str, method: str) -> pd.DataFrame:
-    """Balance classes with over/under-sampling."""
-    if target_column_name not in data.columns:
-        raise ValueError(f"Target column '{target_column_name}' not found in dataset.")
-    X = data.drop(columns=[target_column_name])
-    y = data[target_column_name]
-
-    if method == "oversample":
-        sampler = RandomOverSampler()
-    elif method == "undersample":
-        sampler = RandomUnderSampler()
-    else:
-        raise ValueError("Invalid method. Use 'oversample' or 'undersample'.")
-
-    X_res, y_res = sampler.fit_resample(X, y)
-    balanced = pd.DataFrame(X_res, columns=X.columns)
-    balanced[target_column_name] = y_res
-    return balanced
-
-
-def split_data_with_ratio(data: pd.DataFrame, ratio: float, random_state: int | None = None):
-    """Split into train/test by ratio."""
-    ratio = float(ratio)
-    return train_test_split(data, test_size=ratio, random_state=random_state)
-
-
-# ---------- Helpers: Text ----------
-def ensure_nltk_resources():
-    """Download NLTK resources if missing."""
-    try:
-        _ = stopwords.words("english")
-    except Exception:
-        nltk.download("punkt", quiet=True)
-        nltk.download("stopwords", quiet=True)
-        nltk.download("wordnet", quiet=True)
-
-
-def read_text_data(file_path: str) -> str:
-    """Read text from txt, pdf, docx, or return CSV text column name to preprocess separately."""
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".txt":
-        with open(file_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    elif ext == ".pdf":
-        text = ""
-        with open(file_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                text += page.extract_text() or ""
-        return text
-
-    elif ext == ".docx":
-        document = docx.Document(file_path)
-        return "\n".join(p.text for p in document.paragraphs)
-
-    elif ext == ".csv":
-        # The text pipeline below can handle CSV via preprocess_csv_text
-        return ""  # We will ignore this return and handle CSV separately in the route
-
-    else:
-        raise ValueError("Unsupported file format for text.")
-
-
-def preprocess_csv_text(file_path: str, text_column: str, options: dict) -> pd.DataFrame:
-    """Apply preprocess_text to the CSV's text column and return a DataFrame."""
-    df = pd.read_csv(file_path)
-    if text_column not in df.columns:
-        raise ValueError(f"Column '{text_column}' not found in CSV.")
-    df[text_column] = df[text_column].apply(lambda x: preprocess_text(str(x), **options))
     return df
 
+# -----------------------------------------------------------------------------
+# STREAMLIT STATE
+# -----------------------------------------------------------------------------
+def init_state():
+    if "messages" not in st.session_state:
+        st.session_state.messages: List[Dict[str, str]] = []
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = InMemoryChatMessageHistory()
+    if "df_loaded" not in st.session_state:
+        st.session_state.df_loaded = False
 
-def preprocess_text(
-    text: str,
-    lowercase: bool = True,
-    tokenize: bool = True,
-    remove_punctuation: bool = True,
-    remove_stopwords_opt: bool = True,
-    stemming: bool = False,
-    lemmatization: bool = False,
-    remove_numbers: bool = True,
-    remove_special_characters: bool = True,
-    handle_contractions: bool = True,
-    handle_urls_emails: bool = True,
-    normalize_accents: bool = True,
-) -> str:
-    """Generic text preprocessing."""
-    ensure_nltk_resources()
+init_state()
 
-    if lowercase:
-        text = text.lower()
-    if handle_contractions:
-        text = expand_contractions(text)
-    if handle_urls_emails:
-        text = replace_urls_emails(text)
-
-    tokens = word_tokenize(text) if tokenize else [text]
-
-    if remove_punctuation:
-        tokens = [w for w in tokens if w not in string.punctuation]
-    if remove_numbers:
-        tokens = [w for w in tokens if not w.isdigit()]
-    if remove_special_characters:
-        tokens = [re.sub(r"[^a-zA-Z0-9\s]", "", w) for w in tokens]
-    if remove_stopwords_opt:
-        sw = set(stopwords.words("english"))
-        tokens = [w for w in tokens if w not in sw]
-    if stemming:
-        stemmer = PorterStemmer()
-        tokens = [stemmer.stem(w) for w in tokens]
-    if lemmatization:
-        lem = WordNetLemmatizer()
-        tokens = [lem.lemmatize(w) for w in tokens]
-    if normalize_accents:
-        tokens = [unidecode.unidecode(w) for w in tokens]
-
-    return " ".join(tokens)
-
-
-def expand_contractions(text: str) -> str:
-    contractions_dict = {
-        "ain't": "am not", "aren't": "are not", "can't": "cannot", "can't've": "cannot have",
-        "'cause": "because", "could've": "could have", "couldn't": "could not", "couldn't've": "could not have",
-        "didn't": "did not", "doesn't": "does not", "don't": "do not", "hadn't": "had not", "hadn't've": "had not have",
-        "hasn't": "has not", "haven't": "have not", "he'd": "he would", "he'd've": "he would have",
-        "he'll": "he will", "he'll've": "he will have", "he's": "he is", "how'd": "how did", "how'd'y": "how do you",
-        "how'll": "how will", "how's": "how is", "I'd": "I would", "I'd've": "I would have", "I'll": "I will",
-        "I'll've": "I will have", "I'm": "I am", "I've": "I have", "isn't": "is not", "it'd": "it would",
-        "it'd've": "it would have", "it'll": "it will", "it'll've": "it will have", "it's": "it is", "let's": "let us",
-        "ma'am": "madam", "mayn't": "may not", "might've": "might have", "mightn't": "might not",
-        "mightn't've": "might not have", "must've": "must have", "mustn't": "must not", "mustn't've": "must not have",
-        "needn't": "need not", "needn't've": "need not have", "o'clock": "of the clock", "oughtn't": "ought not",
-        "oughtn't've": "ought not have", "shan't": "shall not", "sha'n't": "shall not", "shan't've": "shall not have",
-        "she'd": "she would", "she'd've": "she would have", "she'll": "she will", "she'll've": "she will have",
-        "she's": "she is", "should've": "should have", "shouldn't": "should not", "shouldn't've": "should not have",
-        "so've": "so have", "so's": "so is", "that'd": "that would", "that'd've": "that would have", "that's": "that is",
-        "there'd": "there would", "there'd've": "there would have", "there's": "there is", "they'd": "they would",
-        "they'd've": "they would have", "they'll": "they will", "they'll've": "they will have", "they're": "they are",
-        "they've": "they have", "to've": "to have", "wasn't": "was not", "we'd": "we would", "we'd've": "we would have",
-        "we'll": "we will", "we'll've": "we will have", "we're": "we are", "we've": "we have", "weren't": "were not",
-        "what'll": "what will", "what'll've": "what will have", "what're": "what are", "what's": "what is",
-        "what've": "what have", "when's": "when is", "when've": "when have", "where'd": "where did", "where's": "where is",
-        "where've": "where have", "who'll": "who will", "who'll've": "who will have", "who's": "who is", "who've": "who have",
-        "why's": "why is", "why've": "why have", "will've": "will have", "won't": "will not", "won't've": "will not have",
-        "would've": "would have", "wouldn't": "would not", "wouldn't've": "would not have", "y'all": "you all",
-        "y'all'd": "you all would", "y'all'd've": "you all would have", "y'all're": "you all are", "y'all've": "you all have",
-        "you'd": "you would", "you'd've": "you would have", "you'll": "you will", "you'll've": "you will have",
-        "you're": "you are", "you've": "you have"
-    }
-    pattern = re.compile('({})'.format('|'.join(map(re.escape, contractions_dict.keys()))),
-                         flags=re.IGNORECASE | re.DOTALL)
-
-    def expand_match(m):
-        match = m.group(0)
-        return contractions_dict.get(match) or contractions_dict.get(match.lower(), match)
-
-    return pattern.sub(expand_match, text)
-
-
-def replace_urls_emails(text: str) -> str:
-    url_pattern = re.compile(r'https?://\S+|www\.\S+')
-    email_pattern = re.compile(r'\b\S+@\S+\.\S+\b')
-    text = re.sub(url_pattern, '<URL>', text)
-    text = re.sub(email_pattern, '<EMAIL>', text)
-    return text
-
-
-# ---------- Helpers: Images ----------
-def load_images_from_zip(zip_file_path: str, extract_folder: str):
-    """Extract .png/.jpg/.jpeg images from a zip and return as list of np arrays (BGR)."""
-    images = []
-    with zipfile.ZipFile(zip_file_path, "r") as zf:
-        zf.extractall(extract_folder)
-
-    for root, _, files in os.walk(extract_folder):
-        for file in files:
-            if file.lower().endswith((".png", ".jpg", ".jpeg")):
-                p = os.path.join(root, file)
-                img = cv2.imread(p)
-                if img is not None:
-                    images.append((p, img))  # (path, image)
-    return images
-
-
-def resize_images(images, width: int, height: int):
-    return [(p, cv2.resize(img, (width, height))) for p, img in images]
-
-
-def rescale_images(images, scale_factor: float):
-    return [(p, cv2.resize(img, None, fx=scale_factor, fy=scale_factor)) for p, img in images]
-
-
-def normalize_images(images):
-    out = []
-    for p, img in images:
-        img_norm = img.astype("float32") / 255.0
-        out.append((p, img_norm))
-    return out
-
-
-def augment_images(
-    images, rotation_angle=0, horizontal_flip=False, vertical_flip=False,
-    crop_x=None, crop_y=None, crop_width=None, crop_height=None
-):
-    augmented = []
-    for p, img in images:
-        aug = img.copy()
-        if rotation_angle:
-            rows, cols = aug.shape[:2]
-            M = cv2.getRotationMatrix2D((cols / 2, rows / 2), rotation_angle, 1)
-            aug = cv2.warpAffine(aug, M, (cols, rows))
-        if horizontal_flip:
-            aug = cv2.flip(aug, 1)
-        if vertical_flip:
-            aug = cv2.flip(aug, 0)
-        if None not in (crop_x, crop_y, crop_width, crop_height) and crop_width > 0 and crop_height > 0:
-            aug = aug[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
-        augmented.append((p, aug))
-    return augmented
-
-
-def convert_to_grayscale(images):
-    return [(p, cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)) for p, img in images]
-
-
-# ---------- Routes ----------
-@app.route("/")
-def index():
-    # Ensure you have templates/index.html & templates/preprocessing_complete.html
-    return render_template("index.html")
-
-
-@app.route("/upload", methods=["POST"])
-def upload_file():
-    if "file" not in request.files:
-        return "No file part"
-
-    file = request.files["file"]
-    if file.filename == "":
-        return "No selected file"
-
-    file_path = os.path.join("uploads", file.filename)
-    file.save(file_path)
-
-    data_type = request.form.get("data_type")
-    if data_type not in ["tabular", "text", "image"]:
-        return "Invalid data type"
-
-    preprocessing_options = request.form.getlist("preprocessing_option")
-    if not preprocessing_options:
-        return "No preprocessing options selected"
-
+# -----------------------------------------------------------------------------
+# TOOL: EXACTLY ONE TOOL (query_hotels)
+# -----------------------------------------------------------------------------
+def clamp_limit(n: Optional[int]) -> int:
     try:
-        # ---------------- TABULAR ----------------
-        if data_type == "tabular":
-            if file.filename.endswith(".csv"):
-                data = pd.read_csv(file_path)
-            elif file.filename.endswith((".xls", ".xlsx")):
-                data = pd.read_excel(file_path)
-            else:
-                return "Unsupported file format for tabular data"
+        n = int(n) if n is not None else 5
+    except Exception:
+        n = 5
+    return max(1, min(10, n))
 
-            if "Handle Missing Values" in preprocessing_options:
-                data = handle_missing_values(data)
+SORTABLE_MAP = {
+    "star_rating": "star_rating",
+    "cleanliness": "cleanliness_base",
+    "comfort": "comfort_base",
+    "facilities": "facilities_base",
+    # Allow a few friendly aliases:
+    "cleanliness_base": "cleanliness_base",
+    "comfort_base": "comfort_base",
+    "facilities_base": "facilities_base",
+}
 
-            if "Categorical Variable Encoding" in preprocessing_options:
-                data = encode_categorical(data)
+@tool("query_hotels", return_direct=False)
+def query_hotels_tool(
+    city: Optional[str] = None,
+    country: Optional[str] = None,
+    min_star: Optional[float] = None,
+    min_cleanliness: Optional[float] = None,
+    min_comfort: Optional[float] = None,
+    min_facilities: Optional[float] = None,
+    sort_by: Optional[str] = "star_rating",
+    limit: Optional[int] = 5,
+) -> str:
+    """
+    Query the hotels dataset with optional filters and sorting.
 
-            if "Handle Outliers" in preprocessing_options:
-                method = request.form.get("method")              # 'iqr' or 'z-score'
-                outliers_method = request.form.get("outliers_method")  # 'clip' or 'remove'
-                if not method or not outliers_method:
-                    return "Outliers method parameters are required."
-                data = handle_outliers(data, method, outliers_method)
+    Args:
+        city (str, optional): case-insensitive city filter
+        country (str, optional): case-insensitive country filter
+        min_star (float, optional): minimum star rating
+        min_cleanliness (float, optional): minimum cleanliness_base
+        min_comfort (float, optional): minimum comfort_base
+        min_facilities (float, optional): minimum facilities_base
+        sort_by (str, optional): one of {'star_rating','cleanliness','comfort','facilities'}
+        limit (int, optional): number of rows to return (clamped to [1,10])
 
-            if "Feature Scaling/Normalization" in preprocessing_options:
-                data = normalize_data(data)
+    Returns:
+        JSON string with keys:
+          - "results": list of rows (dicts)
+          - "count": int
+          - "note": str (present when no results to guide user)
+          - "args_used": dict of effective args
+    """
+    if "hotels_df" not in st.session_state or st.session_state.hotels_df is None:
+        return json.dumps({
+            "results": [],
+            "count": 0,
+            "note": "Dataset not loaded. Please ensure hotels.csv is available and the app re-ran.",
+            "args_used": {}
+        })
 
-            if "Handle Imbalanced Data" in preprocessing_options:
-                target = request.form.get("target_col")  # <- use the actual form field
-                sampling_method = request.form.get("sampling_method")  # 'oversample' or 'undersample'
-                if not target or not sampling_method:
-                    return "Target column and sampling method are required for handling imbalanced data."
-                data = handle_imbalanced_data(data, target, sampling_method)
+    df = st.session_state.hotels_df.copy()
 
-            if "Data Splitting" in preprocessing_options:
-                ratio = request.form.get("split_ratio", "0.2")
-                train, test = split_data_with_ratio(data, ratio)
-                # Save both train and test
-                preproc_train_path = os.path.join("uploads", "preprocessed_train.csv")
-                preproc_test_path = os.path.join("uploads", "preprocessed_test.csv")
-                train.to_csv(preproc_train_path, index=False)
-                test.to_csv(preproc_test_path, index=False)
-                # You could show both links in your template
-                return render_template("preprocessing_complete.html",
-                                       file_path=preproc_train_path,
-                                       extra_file_path=preproc_test_path)
+    # Normalize filters
+    eff_city = (city or "").strip()
+    eff_country = (country or "").strip()
 
-            # If not splitting, just save one consolidated preprocessed file
-            preprocessed_file_path = os.path.join("uploads", "preprocessed_data.csv")
-            data.to_csv(preprocessed_file_path, index=False)
-            return render_template("preprocessing_complete.html", file_path=preprocessed_file_path)
+    # Case-insensitive match by using precomputed __norm
+    if eff_city:
+        df = df[df["city__norm"] == eff_city.lower()]
+    if eff_country:
+        df = df[df["country__norm"] == eff_country.lower()]
 
-        # ---------------- TEXT ----------------
-        elif data_type == "text":
-            ext = os.path.splitext(file_path)[1].lower()
+    # Numeric thresholds
+    if min_star is not None:
+        df = df[df["star_rating"] >= float(min_star)]
+    if min_cleanliness is not None:
+        df = df[df["cleanliness_base"] >= float(min_cleanliness)]
+    if min_comfort is not None:
+        df = df[df["comfort_base"] >= float(min_comfort)]
+    if min_facilities is not None:
+        df = df[df["facilities_base"] >= float(min_facilities)]
 
-            if ext == ".csv":
-                # Expect a text column name from the form, default to 'text'
-                text_column = request.form.get("text_column", "text")
-                options = {
-                    "lowercase": True,
-                    "tokenize": True,
-                    "remove_punctuation": True,
-                    "remove_stopwords_opt": True,
-                    "stemming": False,
-                    "lemmatization": False,
-                    "remove_numbers": True,
-                    "remove_special_characters": True,
-                    "handle_contractions": True,
-                    "handle_urls_emails": True,
-                    "normalize_accents": True,
-                }
-                processed_df = preprocess_csv_text(file_path, text_column, options)
-                preprocessed_file_path = os.path.join("uploads", "preprocessed_text.csv")
-                processed_df.to_csv(preprocessed_file_path, index=False)
-                return render_template("preprocessing_complete.html", file_path=preprocessed_file_path)
-            else:
-                raw_text = read_text_data(file_path)
-                processed_text = preprocess_text(raw_text)
-                preprocessed_file_path = os.path.join("uploads", "preprocessed_text.txt")
-                with open(preprocessed_file_path, "w", encoding="utf-8") as f:
-                    f.write(processed_text)
-                return render_template("preprocessing_complete.html", file_path=preprocessed_file_path)
+    # Sorting
+    sort_key = SORTABLE_MAP.get((sort_by or "").strip().lower(), "star_rating")
+    df = df.sort_values(by=sort_key, ascending=False, kind="mergesort")
 
-        # ---------------- IMAGE ----------------
-        elif data_type == "image":
-            if not file.filename.lower().endswith(".zip"):
-                return "Please upload a .zip containing images."
+    # Clamp limit
+    limit_val = clamp_limit(limit)
+    df = df.head(limit_val)
 
-            extract_folder = os.path.join("uploads", os.path.splitext(file.filename)[0])
-            os.makedirs(extract_folder, exist_ok=True)
-            images = load_images_from_zip(file_path, extract_folder)  # list of (path, img)
+    # Prepare results
+    display_cols = [
+        c for c in [
+            "hotel_name", "city", "country",
+            "star_rating", "cleanliness_base", "comfort_base", "facilities_base",
+            "lat", "lon"
+        ] if c in df.columns
+    ]
 
-            # Process images according to options
-            if "Resizing" in preprocessing_options:
-                width = int(request.form.get("resize_width", 0) or 0)
-                height = int(request.form.get("resize_height", 0) or 0)
-                if width > 0 and height > 0:
-                    images = resize_images(images, width, height)
+    if df.empty:
+        # Suggestion message for no matches
+        note = (
+            "No hotels matched your query. Try relaxing filters (e.g., lower thresholds), "
+            "removing city/country constraints, or choosing a different sort key."
+        )
+        return json.dumps({
+            "results": [],
+            "count": 0,
+            "note": note,
+            "args_used": {
+                "city": eff_city or None,
+                "country": eff_country or None,
+                "min_star": min_star,
+                "min_cleanliness": min_cleanliness,
+                "min_comfort": min_comfort,
+                "min_facilities": min_facilities,
+                "sort_by": sort_key,
+                "limit": limit_val,
+            }
+        })
 
-            if "Rescaling" in preprocessing_options:
-                factor = float(request.form.get("scale_factor", 1.0) or 1.0)
-                images = rescale_images(images, factor)
+    # Convert to list of dicts
+    rows = df[display_cols].to_dict(orient="records")
+    return json.dumps({
+        "results": rows,
+        "count": len(rows),
+        "args_used": {
+            "city": eff_city or None,
+            "country": eff_country or None,
+            "min_star": min_star,
+            "min_cleanliness": min_cleanliness,
+            "min_comfort": min_comfort,
+            "min_facilities": min_facilities,
+            "sort_by": sort_key,
+            "limit": limit_val,
+        }
+    })
 
-            if "Normalization" in preprocessing_options:
-                images = normalize_images(images)
+TOOLS = [query_hotels_tool]
+tool_node = ToolNode(TOOLS)
 
-            if "Data Augmentation" in preprocessing_options:
-                rotation_angle = float(request.form.get("rotation_angle", 0) or 0)
-                horizontal_flip = request.form.get("horizontal_flip", "off") == "on"
-                vertical_flip = request.form.get("vertical_flip", "off") == "on"
-                crop_x = int(request.form.get("crop_x", 0) or 0)
-                crop_y = int(request.form.get("crop_y", 0) or 0)
-                crop_width = int(request.form.get("crop_width", 0) or 0)
-                crop_height = int(request.form.get("crop_height", 0) or 0)
-                images = augment_images(
-                    images,
-                    rotation_angle=rotation_angle,
-                    horizontal_flip=horizontal_flip,
-                    vertical_flip=vertical_flip,
-                    crop_x=crop_x, crop_y=crop_y,
-                    crop_width=crop_width, crop_height=crop_height,
-                )
+# -----------------------------------------------------------------------------
+# LANGGRAPH STATE & MODEL
+# -----------------------------------------------------------------------------
+class MessagesState(TypedDict):
+    messages: List[AnyMessage]
 
-            if "Gray-scale Conversion" in preprocessing_options:
-                images = convert_to_grayscale(images)
+def get_model() -> ChatOpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        st.error("❌ OPENAI_API_KEY not found in environment (.env).")
+        st.info("Create a .env file with:\nOPENAI_API_KEY=your_api_key_here")
+        st.stop()
+    # Assignment-friendly model; feel free to switch to gpt-4o-mini as allowed by your account
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=api_key)
 
-            # Save processed images to a zip
-            preprocessed_zip_path = os.path.join("uploads", "preprocessed_images.zip")
-            with zipfile.ZipFile(preprocessed_zip_path, "w") as zipf:
-                for idx, (orig_path, img) in enumerate(images):
-                    # Decide output extension
-                    out_ext = ".png"
-                    out_name = f"preprocessed_image_{idx}{out_ext}"
-                    out_path = os.path.join("uploads", out_name)
+SYSTEM_PROMPT = (
+    "You are a helpful Hotel QA agent.\n"
+    "- You have exactly ONE tool: query_hotels. Use it whenever the user asks a data question.\n"
+    "- Parse free-text queries into structured tool args (city, country, minimum thresholds, sort_by, limit).\n"
+    "- Sort_by can be one of: star_rating, cleanliness, comfort, facilities.\n"
+    "- Always produce a short natural-language summary followed by a compact table in plain text.\n"
+    "- If there are no results, clearly say so and suggest alternative queries (e.g., relax thresholds or remove filters).\n"
+    "- Do NOT call any other tools or browse the web.\n"
+)
 
-                    # If image is float (normalized), convert back to uint8 for saving
-                    if img.dtype != np.uint8:
-                        # If grayscale float [0,1] -> [0,255]
-                        img_to_save = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+def call_model(state: MessagesState, config: RunnableConfig) -> dict:
+    llm = get_model().bind_tools(TOOLS)
+    # Ensure system prompt is always included at the start
+    msgs: List[AnyMessage] = state["messages"]
+    prefixed = []
+    # If the first message is not a system, prepend our system
+    if not msgs or not isinstance(msgs[0], SystemMessage):
+        prefixed.append(SystemMessage(content=SYSTEM_PROMPT))
+    prefixed.extend(msgs)
+
+    resp = llm.invoke(prefixed, config=config)
+    return {"messages": [resp]}
+
+# Build graph
+graph = StateGraph(MessagesState)
+graph.add_node("model", call_model)
+graph.add_node("tools", tool_node)
+graph.add_edge(START, "model")
+graph.add_conditional_edges("model", tools_condition, {"tools": "tools", "end": END})
+graph.add_edge("tools", "model")
+app_graph = graph.compile()
+
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+st.title("🏨 Hotel QA Agent")
+st.caption("Ask about hotels by city/country, ratings, and more (powered by LangGraph & one tool).")
+st.markdown("---")
+
+# Controls + dataset load
+with st.expander("📂 Dataset", expanded=not st.session_state.df_loaded):
+    st.write(
+        "Place `hotels.csv` (from the Kaggle dataset) in a local `data/` folder. "
+        "We load and normalize it once per session."
+    )
+    csv_path = st.text_input("Path to hotels.csv", value="data/hotels.csv")
+    if st.button("Load/Reload Dataset"):
+        try:
+            st.session_state.hotels_df = load_and_normalize_hotels(csv_path)
+            st.session_state.df_loaded = True
+            st.success(f"Loaded {len(st.session_state.hotels_df)} rows.")
+        except Exception as e:
+            st.session_state.df_loaded = False
+            st.error(f"Failed to load dataset: {e}")
+
+# Clear chat button
+left, right = st.columns([1, 5])
+with left:
+    if st.button("🗑️ Clear Chat"):
+        st.session_state.messages = []
+        st.session_state.chat_history = InMemoryChatMessageHistory()
+        st.rerun()
+with right:
+    st.info("Example: *Top 5 hotels in Paris by cleanliness*")
+
+st.markdown("---")
+
+# Show prior messages
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# Chat input
+user_msg = st.chat_input("What would you like to know?")
+if user_msg:
+    # Guard: ensure dataset is loaded
+    if not st.session_state.df_loaded:
+        st.error("Please load the dataset first (see the Dataset section above).")
+    else:
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": user_msg})
+        st.session_state.chat_history.add_message(HumanMessage(content=user_msg))
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    # Build the conversation for the graph
+                    history_msgs: List[AnyMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+                    # Replay messages as AI/Human for the agent
+                    for m in st.session_state.messages:
+                        if m["role"] == "user":
+                            history_msgs.append(HumanMessage(content=m["content"]))
+                        elif m["role"] == "assistant":
+                            history_msgs.append(AIMessage(content=m["content"]))
+
+                    # Invoke the graph
+                    result = app_graph.invoke({"messages": history_msgs})
+
+                    # Extract the last assistant message (after tool runs)
+                    final_msgs: List[AnyMessage] = result["messages"]
+                    # Save any intermediate tool messages (optional display)
+                    rendered = False
+                    for msg in final_msgs:
+                        if isinstance(msg, ToolMessage):
+                            # Optionally, you could show tool raw JSON in an expander for debugging.
+                            # We won't display it to keep UI clean.
+                            pass
+
+                    # Find last AI message to display to the user
+                    last_ai = None
+                    for msg in reversed(final_msgs):
+                        if isinstance(msg, AIMessage):
+                            last_ai = msg
+                            break
+
+                    if last_ai is None:
+                        # Fallback in unlikely case
+                        st.markdown("I couldn't generate a response. Please try rephrasing your query.")
+                        ai_text = "I couldn't generate a response. Please try rephrasing your query."
                     else:
-                        img_to_save = img
+                        ai_text = last_ai.content
+                        st.markdown(ai_text)
 
-                    # Save using cv2 (handles both gray & color)
-                    cv2.imwrite(out_path, img_to_save)
-                    zipf.write(out_path, arcname=out_name)
+                    # Store assistant response in streamlit UI state
+                    st.session_state.messages.append({"role": "assistant", "content": ai_text})
+                    st.session_state.chat_history.add_message(AIMessage(content=ai_text))
 
-            return render_template("preprocessing_complete.html", file_path=preprocessed_zip_path)
-
-        else:
-            return "Something is wrong."
-
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
-@app.route("/download/<path:file_path>")
-def download_file(file_path):
-    return send_file(file_path, as_attachment=True)
-
-
-if __name__ == "__main__":
-    # For local testing; in production use a WSGI server (gunicorn, etc.)
-    app.run(debug=True)
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
+                    st.info("Check your API key, dataset path, and internet connection (for the LLM).")
