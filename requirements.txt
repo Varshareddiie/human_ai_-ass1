@@ -1,19 +1,36 @@
-# Core app
+# App frameworks (keep the one you use)
 streamlit>=1.35
+flask>=3.0
+# gunicorn is useful if you deploy Flask on a server (not needed for Streamlit Cloud)
+gunicorn>=21.2
+
+# Data & ML
 pandas>=2.2
 numpy>=1.26
+scipy>=1.10
 scikit-learn>=1.3
 imbalanced-learn>=0.11
-python-dotenv>=1.0
 
-# LLM / agents (only keep if you're actually using them)
+# NLP
+nltk>=3.8
+Unidecode>=1.3
+PyPDF2>=3.0
+python-docx>=1.1
+
+# Images
+opencv-python-headless>=4.10
+Pillow>=10.0
+
+# Excel readers (for pandas.read_excel)
+openpyxl>=3.1
+xlrd>=2.0
+
+# Plotting (optional but common)
+matplotlib>=3.8
+
+# Env & LLMs (only if you really use them)
+python-dotenv>=1.0
 openai>=1.40
 langchain-core>=0.2
 langchain-openai>=0.2
 langgraph>=0.2
-
-# Optional plotting
-matplotlib>=3.8
-
-# Remove Flask unless you truly run a Flask server (Streamlit doesn't need it)
-# flask
