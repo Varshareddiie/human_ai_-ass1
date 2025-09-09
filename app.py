@@ -1,4 +1,4 @@
-
+1
 """
 Grad Director AI Chatbot -> Hotel QA Agent (Assignment-Ready)
 
@@ -309,7 +309,7 @@ app_graph = graph.compile()
 # UI
 # -----------------------------------------------------------------------------
 st.title("🏨 Hotel QA Agent")
-st.caption("Ask about hotels by city/country, ratings, and more (LangGraph + one tool).")
+st.caption("Ask any queries regarding the hotel ratings,hotels by city/country.")
 st.markdown("---")
 
 # ----- Dataset controls (upload once, save to data/hotels.csv, then load once per session)
@@ -417,6 +417,7 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path (Dataset section), and internet connection (for the LLM).")
+
 
 
 
