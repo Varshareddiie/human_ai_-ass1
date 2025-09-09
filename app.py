@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""
+#dataset can be added by us :  """
 Grad Director AI Chatbot -> Hotel QA Agent (Assignment-Ready)
 
 Implements a LangGraph agent with exactly ONE custom tool that queries a hotels.csv
@@ -18,8 +17,8 @@ Run: `streamlit run app.py`
 """
 
 import os
-import re
 import json
+from pathlib import Path
 from typing import List, Optional, TypedDict, Any, Dict
 
 import pandas as pd
@@ -28,9 +27,8 @@ from dotenv import load_dotenv
 
 # LangChain / LangGraph
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, AnyMessage
 from langchain_core.tools import tool
-from langchain_core.messages import AnyMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.runnables import RunnableConfig
@@ -48,7 +46,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# DATA LOADING (ONCE PER SESSION)
+# DATA LOADING (ONCE PER SESSION) + UPLOAD/SAVE SUPPORT
 # -----------------------------------------------------------------------------
 REQUIRED_COLS = {
     "hotel id": "hotel_id",
@@ -64,7 +62,7 @@ REQUIRED_COLS = {
 }
 
 NUMERIC_COLS = ["star_rating", "cleanliness_base", "comfort_base", "facilities_base", "lat", "lon"]
-TEXT_COLS = ["city", "country", "hotel_name"]  # 'hotel_id' may be numeric; keep as-is if present
+TEXT_COLS = ["city", "country", "hotel_name"]  # 'hotel_id' may be numeric
 
 @st.cache_data(show_spinner=False)
 def load_and_normalize_hotels(csv_path: str) -> pd.DataFrame:
@@ -84,11 +82,10 @@ def load_and_normalize_hotels(csv_path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns in CSV: {missing}")
 
-    # Normalize text columns: strip & lowercase for consistent filtering
+    # Normalize text columns and create __norm copies for matching
     for c in TEXT_COLS:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
-            # Keep original-cased display copy, but store a normalized column for matching
             df[f"{c}__norm"] = df[c].str.lower()
 
     # Numeric coercion
@@ -120,6 +117,8 @@ def init_state():
         st.session_state.chat_history = InMemoryChatMessageHistory()
     if "df_loaded" not in st.session_state:
         st.session_state.df_loaded = False
+    if "hotels_df" not in st.session_state:
+        st.session_state.hotels_df = None
 
 init_state()
 
@@ -138,7 +137,7 @@ SORTABLE_MAP = {
     "cleanliness": "cleanliness_base",
     "comfort": "comfort_base",
     "facilities": "facilities_base",
-    # Allow a few friendly aliases:
+    # Allow aliases:
     "cleanliness_base": "cleanliness_base",
     "comfort_base": "comfort_base",
     "facilities_base": "facilities_base",
@@ -223,7 +222,6 @@ def query_hotels_tool(
     ]
 
     if df.empty:
-        # Suggestion message for no matches
         note = (
             "No hotels matched your query. Try relaxing filters (e.g., lower thresholds), "
             "removing city/country constraints, or choosing a different sort key."
@@ -244,7 +242,6 @@ def query_hotels_tool(
             }
         })
 
-    # Convert to list of dicts
     rows = df[display_cols].to_dict(orient="records")
     return json.dumps({
         "results": rows,
@@ -274,9 +271,8 @@ def get_model() -> ChatOpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         st.error("❌ OPENAI_API_KEY not found in environment (.env).")
-        st.info("Create a .env file with:\nOPENAI_API_KEY=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")
+        st.info("Create a .env file with one line:\nOPENAI_API_KEY=YOUR_KEY_HERE")
         st.stop()
-    # Assignment-friendly model; feel free to switch to gpt-4o-mini as allowed by your account
     return ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=api_key)
 
 SYSTEM_PROMPT = (
@@ -291,14 +287,11 @@ SYSTEM_PROMPT = (
 
 def call_model(state: MessagesState, config: RunnableConfig) -> dict:
     llm = get_model().bind_tools(TOOLS)
-    # Ensure system prompt is always included at the start
     msgs: List[AnyMessage] = state["messages"]
     prefixed = []
-    # If the first message is not a system, prepend our system
     if not msgs or not isinstance(msgs[0], SystemMessage):
         prefixed.append(SystemMessage(content=SYSTEM_PROMPT))
     prefixed.extend(msgs)
-
     resp = llm.invoke(prefixed, config=config)
     return {"messages": [resp]}
 
@@ -315,26 +308,48 @@ app_graph = graph.compile()
 # UI
 # -----------------------------------------------------------------------------
 st.title("🏨 Hotel QA Agent")
-st.caption("Ask about hotels by city/country, ratings, and more (powered by LangGraph & one tool).")
+st.caption("Ask about hotels by city/country, ratings, and more (LangGraph + one tool).")
 st.markdown("---")
 
-# Controls + dataset load
-with st.expander("📂 Dataset", expanded=not st.session_state.df_loaded):
+# ----- Dataset controls (upload once, save to data/hotels.csv, then load once per session)
+HERE = Path(__file__).parent
+DATA_DIR = HERE / "data"
+DEFAULT_CSV_PATH = DATA_DIR / "hotels.csv"
+
+with st.expander("📂 Dataset (upload or load)", expanded=not st.session_state.df_loaded):
     st.write(
-        "Place `hotels.csv` (from the Kaggle dataset) in a local `data/` folder. "
-        "We load and normalize it once per session."
+        "Upload your `hotels.csv` here once. It will be saved to `data/hotels.csv` "
+        "so future runs auto-load it."
     )
-    csv_path = st.text_input("Path to hotels.csv", value="data/hotels.csv")
+
+    # Upload-and-save flow
+    uploaded = st.file_uploader("Upload hotels.csv", type=["csv"])
+    if uploaded is not None:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            temp_df = pd.read_csv(uploaded)
+            temp_df.to_csv(DEFAULT_CSV_PATH, index=False)
+            st.success(f"✅ Saved to {DEFAULT_CSV_PATH.relative_to(HERE)}")
+        except Exception as e:
+            st.error(f"Failed to save uploaded CSV: {e}")
+
+    # Allow custom path too (fallback / advanced)
+    csv_path_input = st.text_input(
+        "Path to hotels.csv",
+        value=str(DEFAULT_CSV_PATH if DEFAULT_CSV_PATH.exists() else "data/hotels.csv"),
+    )
+
+    # Load/Reload button
     if st.button("Load/Reload Dataset"):
         try:
-            st.session_state.hotels_df = load_and_normalize_hotels(csv_path)
+            st.session_state.hotels_df = load_and_normalize_hotels(csv_path_input)
             st.session_state.df_loaded = True
             st.success(f"Loaded {len(st.session_state.hotels_df)} rows.")
         except Exception as e:
             st.session_state.df_loaded = False
             st.error(f"Failed to load dataset: {e}")
 
-# Clear chat button
+# Clear chat button + example
 left, right = st.columns([1, 5])
 with left:
     if st.button("🗑️ Clear Chat"):
@@ -356,7 +371,7 @@ user_msg = st.chat_input("What would you like to know?")
 if user_msg:
     # Guard: ensure dataset is loaded
     if not st.session_state.df_loaded:
-        st.error("Please load the dataset first (see the Dataset section above).")
+        st.error("Please load the dataset first (use the Dataset section above).")
     else:
         # Add user message
         st.session_state.messages.append({"role": "user", "content": user_msg})
@@ -369,7 +384,6 @@ if user_msg:
                 try:
                     # Build the conversation for the graph
                     history_msgs: List[AnyMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
-                    # Replay messages as AI/Human for the agent
                     for m in st.session_state.messages:
                         if m["role"] == "user":
                             history_msgs.append(HumanMessage(content=m["content"]))
@@ -381,15 +395,7 @@ if user_msg:
 
                     # Extract the last assistant message (after tool runs)
                     final_msgs: List[AnyMessage] = result["messages"]
-                    # Save any intermediate tool messages (optional display)
-                    rendered = False
-                    for msg in final_msgs:
-                        if isinstance(msg, ToolMessage):
-                            # Optionally, you could show tool raw JSON in an expander for debugging.
-                            # We won't display it to keep UI clean.
-                            pass
 
-                    # Find last AI message to display to the user
                     last_ai = None
                     for msg in reversed(final_msgs):
                         if isinstance(msg, AIMessage):
@@ -397,17 +403,17 @@ if user_msg:
                             break
 
                     if last_ai is None:
-                        # Fallback in unlikely case
-                        st.markdown("I couldn't generate a response. Please try rephrasing your query.")
                         ai_text = "I couldn't generate a response. Please try rephrasing your query."
+                        st.markdown(ai_text)
                     else:
                         ai_text = last_ai.content
                         st.markdown(ai_text)
 
-                    # Store assistant response in streamlit UI state
+                    # Store assistant response
                     st.session_state.messages.append({"role": "assistant", "content": ai_text})
                     st.session_state.chat_history.add_message(AIMessage(content=ai_text))
 
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
-                    st.info("Check your API key, dataset path, and internet connection (for the LLM).")
+                    st.info("Check your API key, dataset path (Dataset section), and internet connection (for the LLM).")
+
