@@ -109,7 +109,7 @@ st.write("Columns:", list(df.columns))
 
     # Standardize columns: lowercase, strip & map to internal names
 col_map = {}
-    for c in df.columns:
+for c in df.columns:
         key = c.strip().lower()
         if key in REQUIRED_COLS:
             col_map[c] = REQUIRED_COLS[key]
@@ -447,5 +447,6 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path, and internet connection (for the LLM).")
+
 
 
