@@ -67,9 +67,18 @@ NUMERIC_COLS = ["star_rating", "cleanliness_base", "comfort_base", "facilities_b
 TEXT_COLS = ["city", "country", "hotel_name"]  # 'hotel_id' may be numeric; keep as-is if present
 
 @st.cache_data(show_spinner=False)
-def load_and_normalize_hotels(hotels.csv: str) -> pd.DataFrame:
-    # Load
-    df = pd.read_csv(hotels.csv)
+import streamlit as st
+import pandas as pd
+
+# Upload box
+uploaded = st.file_uploader("Upload hotels.csv", type=["csv"])
+
+if uploaded is not None:
+    df = pd.read_csv(uploaded)
+    st.success("✅ Hotels dataset loaded!")
+    st.write(df.head())  # show first 5 rows
+else:
+    st.warning("⚠️ Please upload hotels.csv to continue.")
 
     # Standardize columns: lowercase, strip & map to internal names
     col_map = {}
@@ -411,5 +420,6 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path, and internet connection (for the LLM).")
+
 
 
