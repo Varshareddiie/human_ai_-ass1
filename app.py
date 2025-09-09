@@ -411,3 +411,4 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path, and internet connection (for the LLM).")
+
