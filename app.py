@@ -113,7 +113,7 @@ for c in df.columns:
         key = c.strip().lower()
         if key in REQUIRED_COLS:
             col_map[c] = REQUIRED_COLS[key]
-    df = df.rename(columns=col_map)
+df = df.rename(columns=col_map)
 
     # Ensure all required columns exist
     missing = [v for v in REQUIRED_COLS.values() if v not in df.columns]
@@ -447,6 +447,7 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path, and internet connection (for the LLM).")
+
 
 
 
