@@ -292,7 +292,7 @@ app_graph = graph.compile()
 # UI
 # -----------------------------------------------------------------------------
 st.title("🏨 Hotel QA Agent")
-st.caption("Ask any queries regarding the hotel ratings,hotels by city/country.")
+st.caption(""Find your ideal stay! I can help you search for hotels by city or country, filter by star ratings, and provide all the details you need to book the perfect room."")
 st.markdown("---")
 
 # ----- Dataset controls (upload once, save to data/hotels.csv, then load once per session)
@@ -400,6 +400,7 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path (Dataset section), and internet connection (for the LLM).")
+
 
 
 
