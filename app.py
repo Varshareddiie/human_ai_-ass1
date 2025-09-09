@@ -1,21 +1,4 @@
-1
-"""
-Grad Director AI Chatbot -> Hotel QA Agent (Assignment-Ready)
 
-Implements a LangGraph agent with exactly ONE custom tool that queries a hotels.csv
-dataset, and a Streamlit chat interface.
-
-Features required by the assignment:
-- Loads hotels.csv once per session and normalizes columns
-- Exactly one tool: query_hotels (structured args; filters, thresholds, sort, limit)
-- LangGraph orchestration with tool invocation
-- Natural-language answers + tabular text summary
-- Handles no-match cases with explicit guidance
-- Clamp limit to [1, 10]
-- Uses OPENAI_API_KEY from environment (.env)
-
-Run: `streamlit run app.py`
-"""
 
 import os
 import json
@@ -417,6 +400,7 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path (Dataset section), and internet connection (for the LLM).")
+
 
 
 
