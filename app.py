@@ -68,8 +68,23 @@ TEXT_COLS = ["city", "country", "hotel_name"]  # 'hotel_id' may be numeric; keep
 
 @st.cache_data(show_spinner=False)
 def load_and_normalize_hotels(csv_path: str) -> pd.DataFrame:
-    # Load
-    df = pd.read_csv(csv_path)
+    from pathlib import Path
+import pandas as pd
+import streamlit as st
+
+HERE = Path(__file__).parent
+CSV_PATH = HERE / "data" / "hotels.csv"   # <-- use this, not a plain string
+
+# Safety check + helpful debug
+st.write("Looking for CSV at:", CSV_PATH.resolve())
+
+if not CSV_PATH.exists():
+    st.error("Couldn't find data/hotels.csv next to this app. Upload it or place it there.")
+    st.stop()
+
+df = pd.read_csv(CSV_PATH)
+st.success("✅ Loaded data/hotels.csv")
+st.write(df.head())
 
     # Standardize columns: lowercase, strip & map to internal names
     col_map = {}
@@ -411,4 +426,5 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path, and internet connection (for the LLM).")
+
 
