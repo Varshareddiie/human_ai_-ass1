@@ -1,5 +1,5 @@
 
-"""
+
 Grad Director AI Chatbot -> Hotel QA Agent (Assignment-Ready)
 
 Implements a LangGraph agent with exactly ONE custom tool that queries a hotels.csv
@@ -68,52 +68,16 @@ TEXT_COLS = ["city", "country", "hotel_name"]  # 'hotel_id' may be numeric; keep
 
 @st.cache_data(show_spinner=False)
 def load_and_normalize_hotels(csv_path: str) -> pd.DataFrame:
-  from pathlib import Path
-import streamlit as st
-import pandas as pd
-
-st.title("🏨 Hotels Data App")
-
-# Where we want the file to live (next to this script, inside data/)
-HERE = Path(__file__).parent
-DATA_DIR = HERE / "data"
-CSV_PATH = DATA_DIR / "hotels.csv"
-
-df = None
-
-# 1) If the file is already saved, just load it
-if CSV_PATH.exists():
-    df = pd.read_csv(CSV_PATH)
-    st.info(f"Loaded saved dataset: {CSV_PATH}")
-
-# 2) Otherwise, ask the user to upload it and then save it permanently
-else:
-    uploaded = st.file_uploader("Upload your hotels.csv file", type=["csv"])
-    if uploaded is not None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        df = pd.read_csv(uploaded)
-        df.to_csv(CSV_PATH, index=False)  # <- saves it for next time
-        st.success("✅ Saved your file to data/hotels.csv (will auto-load next time).")
-    else:
-        st.warning("⚠️ Please upload hotels.csv to continue.")
-        st.stop()
-
-# ---- From here on, you can use df safely ----
-st.subheader("Preview")
-st.write(df.head())
-
-st.subheader("Basic Info")
-st.write(f"Rows: {df.shape[0]}, Columns: {df.shape[1]}")
-st.write("Columns:", list(df.columns))
-
+    # Load
+    df = pd.read_csv(csv_path)
 
     # Standardize columns: lowercase, strip & map to internal names
-col_map = {}
-for c in df.columns:
+    col_map = {}
+    for c in df.columns:
         key = c.strip().lower()
         if key in REQUIRED_COLS:
             col_map[c] = REQUIRED_COLS[key]
-df = df.rename(columns=col_map)
+    df = df.rename(columns=col_map)
 
     # Ensure all required columns exist
     missing = [v for v in REQUIRED_COLS.values() if v not in df.columns]
@@ -447,7 +411,3 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path, and internet connection (for the LLM).")
-
-
-
-
