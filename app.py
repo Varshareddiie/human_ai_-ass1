@@ -255,7 +255,7 @@ def get_model() -> ChatOpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         st.error("❌ OPENAI_API_KEY not found in environment (.env).")
-        st.info("Create a .env file with one line:\nOPENAI_API_KEY=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")
+        st.info("Create a .env file with one line:\nOPENAI_API_KEY=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")
         st.stop()
     return ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=api_key)
 
@@ -400,6 +400,7 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path (Dataset section), and internet connection (for the LLM).")
+
 
 
 
