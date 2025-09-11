@@ -268,6 +268,16 @@ SYSTEM_PROMPT = (
     "- If there are no results, clearly say so and suggest alternative queries (e.g., relax thresholds or remove filters).\n"
     "- Do NOT call any other tools or browse the web.\n"
 )
+from langgraph.prebuilt import create_react_agent
+
+def build_agent():
+    llm = get_model()
+    return create_react_agent(
+        llm,
+        tools=TOOLS,
+        messages_modifier=SYSTEM_PROMPT   # ✅ use messages_modifier, not state_modifier
+    )
+
 
 def call_model(state: MessagesState, config: RunnableConfig) -> dict:
     llm = get_model().bind_tools(TOOLS)
@@ -400,6 +410,7 @@ if user_msg:
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
                     st.info("Check your API key, dataset path (Dataset section), and internet connection (for the LLM).")
+
 
 
 
